@@ -1,0 +1,6 @@
+excluded_users:
+  - "U12345ABCDE"
+  - "U67890FGHIJ"
+
+excluded_message_links:
+  - "https://yourworkspace.slack.com/archives/C0XXXXXXX/p1234567890123456"

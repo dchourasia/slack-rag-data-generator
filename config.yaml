@@ -1,0 +1,11 @@
+slack:
+  channel_id: "C0XXXXXXX"
+  workspace_url: "https://yourworkspace.slack.com"
+
+output:
+  base_dir: "."
+
+chunking:
+  max_tokens_per_chunk: 50000
+  chunk_overlap: 200
+  encoding_name: "cl100k_base"
