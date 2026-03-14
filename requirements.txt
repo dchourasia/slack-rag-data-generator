@@ -3,3 +3,5 @@ python-dotenv>=1.0.0
 PyYAML>=6.0
 langchain-text-splitters>=0.2.0
 tiktoken>=0.7.0
+google-api-python-client>=2.130.0
+google-auth>=2.29.0

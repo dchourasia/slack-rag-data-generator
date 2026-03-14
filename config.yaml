@@ -2,6 +2,11 @@ slack:
   channel_id: "C0XXXXXXX"
   workspace_url: "https://yourworkspace.slack.com"
 
+google_form:
+  form_id: "1FAIpQLSe_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+  user_id_question_id: "6f1a2b3c"
+  message_links_question_id: "7d4e5f6a"
+
 output:
   base_dir: "."
 
