@@ -63,10 +63,12 @@ Output directories (auto-created at runtime):
 
 ```env
 SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+SLACK_USER_TOKEN=xoxp-your-user-token-here
 GOOGLE_SERVICE_ACCOUNT_KEY_FILE=service-account-key.json
 ```
 
-- The Slack bot token requires these OAuth scopes: `channels:history`, `channels:read`, `users:read`, `users:read.email`.
+- The Slack **bot token** requires these OAuth scopes: `channels:history`, `channels:read`, `users:read`, `users:read.email`.
+- The Slack **user token** (optional, for list item comment extraction) requires these User Token Scopes: `channels:history`, `groups:history`. If not set, the pipeline still runs but skips list item comment extraction.
 - The Google service account key file must be a JSON key downloaded from the Google Cloud console. The Google Form must be shared with the service account's email address.
 
 ### 1b. `config.yaml` -- Main Configuration
@@ -184,17 +186,25 @@ flowchart TD
     CheckCursor -->|No| ProcessMessages[Iterate over all messages]
     ProcessMessages --> HasThread{"reply_count > 0?"}
     HasThread -->|Yes| FetchReplies["Call conversations.replies with pagination"]
-    HasThread -->|No| BuildRecord[Build message record]
-    FetchReplies --> BuildRecord
+    HasThread -->|No| DetectList{"Text contains list URL?"}
+    FetchReplies --> DetectList
+    DetectList -->|Yes| CollectListID["Collect list_id + record_id"]
+    DetectList -->|No| BuildRecord[Build message record]
+    CollectListID --> BuildRecord
     BuildRecord --> MoreMessages{More messages?}
     MoreMessages -->|Yes| ProcessMessages
-    MoreMessages -->|No| SaveJSON["Save to slack_raw_data_<ts>/messages.json"]
+    MoreMessages -->|No| HasUserToken{"SLACK_USER_TOKEN set?"}
+    HasUserToken -->|Yes| FetchListComments["For each unique list_id:\n1. Derive conversation C... from F...\n2. conversations.history on list conv\n3. conversations.replies for each threaded item"]
+    HasUserToken -->|No| SkipLists["Log warning, skip list comments"]
+    FetchListComments --> SaveJSON["Save messages.json + list_comments.json"]
+    SkipLists --> SaveJSON
     SaveJSON --> SaveMeta["Save metadata.json"]
     SaveMeta --> Done[Return output directory path]
 ```
 
 ### Key Implementation Details
 
+- **Two Slack Clients**: A bot client (`SLACK_BOT_TOKEN`, `xoxb-`) for channel messages and user data. An optional user client (`SLACK_USER_TOKEN`, `xoxp-`) for list item comment access. If the user token is absent, list comment extraction is skipped gracefully.
 - **Slack SDK Client**: Use `slack_sdk.WebClient(token=bot_token)` -- do NOT use the MCP Slack tools (they lack pagination cursor support needed for full extraction).
 - **Pagination**: Every paginated API call (`conversations.history`, `conversations.replies`, `users.list`) must loop until `response_metadata.next_cursor` is empty/absent:
 
@@ -213,6 +223,14 @@ flowchart TD
 - **Message Link Construction**: Build links locally instead of calling `chat.getPermalink` (avoids extra rate-limited API calls):
   - Top-level message: `{workspace_url}/archives/{channel_id}/p{ts.replace('.', '')}`
   - Thread reply: `{workspace_url}/archives/{channel_id}/p{reply_ts.replace('.', '')}?thread_ts={parent_ts.replace('.', '')}&cid={channel_id}`
+- **List Item Detection**: Each message's text is scanned with regex for Slack List URLs matching `slack.com/lists/<team>/<list_id>?record_id=<record_id>`. Messages containing these URLs are tagged with `is_list_item: true` and their `list_refs` (list_id + record_id pairs).
+- **List Item Comment Extraction** (user token required): Slack stores list item comments in a hidden companion conversation. Each List file (`F07SBP17R7Z`) has a parallel conversation (`C07SBP17R7Z`) where every list item is a message and comments are thread replies. The extractor:
+  1. Collects all unique list IDs from channel messages.
+  2. For each list, derives the conversation ID by swapping the `F` prefix for `C`.
+  3. Calls `conversations.history` on the list conversation (user token) to get all item messages.
+  4. Calls `conversations.replies` for each item with `reply_count > 0` to fetch comments.
+  5. Saves the results in `list_comments.json` keyed by list ID.
+  6. If the user token cannot access a list conversation, logs a warning and skips that list.
 - **Raw Data Schema** (`messages.json`): A JSON array where each element is:
 
 ```json
@@ -224,6 +242,8 @@ flowchart TD
     "link": "https://workspace.slack.com/archives/C0XXX/p1710000000000100",
     "thread_ts": "1710000000.000100",
     "reply_count": 2,
+    "is_list_item": false,
+    "list_refs": [],
     "replies": [
       {
         "ts": "1710000001.000200",
@@ -236,7 +256,31 @@ flowchart TD
   }
 ```
 
-- **Output**: `metadata.json` alongside `messages.json` records the channel ID, extraction timestamp, total message count, and the user map.
+- **List Comments Schema** (`list_comments.json`): A dict keyed by list ID, each containing an array of items with comments:
+
+```json
+  {
+    "F07SBP17R7Z": [
+      {
+        "list_id": "F07SBP17R7Z",
+        "conversation_id": "C07SBP17R7Z",
+        "item_ts": "1710000000.000100",
+        "item_text": "A comment was added",
+        "comments": [
+          {
+            "ts": "1710000001.000200",
+            "user_id": "U67890DEF",
+            "user_name": "jane.smith",
+            "text": "Looking into this issue now",
+            "link": "https://workspace.slack.com/archives/C07SBP17R7Z/p1710000001000200?..."
+          }
+        ]
+      }
+    ]
+  }
+```
+
+- **Output**: `metadata.json` alongside `messages.json` (and optionally `list_comments.json`) records the channel ID, extraction timestamp, total message count, list statistics, and the user map.
 
 ---
 
