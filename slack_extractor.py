@@ -1,7 +1,7 @@
 """
 Step 1 – Extract the full message history (including thread replies) of a
-Slack channel, plus comments on Slack List items, and persist the raw data
-as structured JSON.
+Slack channel, plus Slack List item details and comments, and persist the
+raw data as structured JSON.
 """
 
 import json
@@ -10,6 +10,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 import yaml
@@ -62,7 +63,7 @@ def _parse_list_refs(text: str) -> list[dict]:
 
 
 def _call_with_retry(api_method, **kwargs):
-    """Call a Slack API method with automatic retry on rate-limit (429)."""
+    """Call a Slack API method with retry on rate-limit and network errors."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return api_method(**kwargs)
@@ -77,6 +78,27 @@ def _call_with_retry(api_method, **kwargs):
                     attempt, MAX_RETRIES, retry_after,
                 )
                 time.sleep(retry_after)
+            else:
+                raise
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            if attempt == MAX_RETRIES:
+                raise
+            wait = DEFAULT_RETRY_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                "Network error (attempt %d/%d): %s. Retrying in %ds …",
+                attempt, MAX_RETRIES, exc, wait,
+            )
+            time.sleep(wait)
+        except Exception as exc:
+            if "IncompleteRead" in type(exc).__name__ or "IncompleteRead" in str(exc):
+                if attempt == MAX_RETRIES:
+                    raise
+                wait = DEFAULT_RETRY_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "Incomplete response (attempt %d/%d): %s. Retrying in %ds …",
+                    attempt, MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
             else:
                 raise
     raise RuntimeError(f"Slack API call failed after {MAX_RETRIES} retries")
@@ -177,6 +199,39 @@ def _list_id_to_conversation(list_id: str) -> str:
     return "C" + list_id[1:]
 
 
+RECORD_ID_RE = re.compile(r"Rec[A-Za-z0-9]+")
+
+
+def _extract_record_id_from_message(msg: dict, list_id: str) -> str | None:
+    """Try to extract a record_id from a hidden conversation message."""
+    blocks = msg.get("blocks", [])
+    for block in blocks:
+        for element in block.get("elements", []):
+            for child in element.get("elements", []):
+                url = child.get("url", "")
+                if list_id in url:
+                    m = re.search(r"record_id=(Rec[A-Za-z0-9]+)", url)
+                    if m:
+                        return m.group(1)
+                text_val = child.get("text", "")
+                m = RECORD_ID_RE.search(text_val)
+                if m:
+                    return m.group(0)
+
+    metadata = msg.get("metadata", {})
+    event_payload = metadata.get("event_payload", {})
+    rid = event_payload.get("record_id") or event_payload.get("item_id")
+    if rid:
+        return rid
+
+    text = msg.get("text", "")
+    m = re.search(r"record_id=(Rec[A-Za-z0-9]+)", text)
+    if m:
+        return m.group(1)
+
+    return None
+
+
 def _fetch_list_item_comments(
     user_client: WebClient,
     list_id: str,
@@ -222,11 +277,15 @@ def _fetch_list_item_comments(
     for item_msg in threaded:
         item_ts = item_msg["ts"]
         replies = _fetch_thread_replies(user_client, conv_id, item_ts)
+
+        record_id = _extract_record_id_from_message(item_msg, list_id)
+
         results.append({
             "list_id": list_id,
             "conversation_id": conv_id,
             "item_ts": item_ts,
             "item_text": item_msg.get("text", ""),
+            "record_id": record_id,
             "comments": [
                 {
                     "ts": r["ts"],
@@ -247,6 +306,163 @@ def _fetch_list_item_comments(
         list_id, total_comments, len(results),
     )
     return results
+
+
+# ---------------------------------------------------------------------------
+# List item detail helpers (requires lists:read scope)
+# ---------------------------------------------------------------------------
+
+def _parse_item_fields(fields: list[dict], user_map: dict[str, str]) -> dict:
+    """Extract key-value pairs from a list item's ``fields`` array."""
+    parsed: dict[str, str] = {}
+    for field in fields:
+        key = field.get("key", field.get("column_id", "unknown"))
+        if "text" in field and field["text"]:
+            parsed[key] = field["text"]
+        elif "select" in field:
+            parsed[key] = ", ".join(field["select"])
+        elif "date" in field:
+            parsed[key] = ", ".join(field["date"])
+        elif "user" in field:
+            parsed[key] = ", ".join(
+                user_map.get(uid, uid) for uid in field["user"]
+            )
+        elif "number" in field:
+            parsed[key] = ", ".join(str(n) for n in field["number"])
+        elif "checkbox" in field:
+            cb = field["checkbox"]
+            if isinstance(cb, list):
+                parsed[key] = str(cb[0]) if cb else "False"
+            else:
+                parsed[key] = str(cb)
+        elif "email" in field:
+            parsed[key] = ", ".join(field["email"])
+        elif "link" in field:
+            parsed[key] = ", ".join(
+                lnk.get("originalUrl", lnk.get("displayName", ""))
+                for lnk in field["link"]
+            )
+        elif field.get("value") is not None:
+            parsed[key] = str(field["value"])
+    return parsed
+
+
+def _fetch_list_items(
+    client: WebClient,
+    list_id: str,
+    user_map: dict[str, str],
+) -> list[dict]:
+    """
+    Fetch every item from a Slack List via ``slackLists.items.list``.
+
+    Returns a list of dicts with ``record_id``, ``title``, ``fields``, etc.
+    Requires the ``lists:read`` OAuth scope on the token.
+    """
+    logger.info("Fetching list item details for %s via slackLists.items.list …", list_id)
+    raw_items: list[dict] = []
+    cursor: str | None = None
+    while True:
+        payload: dict = {"list_id": list_id, "limit": 100}
+        if cursor:
+            payload["cursor"] = cursor
+        api_fn = partial(client.api_call, "slackLists.items.list")
+        resp = _call_with_retry(api_fn, json=payload)
+        raw_items.extend(resp.get("items", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    logger.info("  List %s: %d items from Lists API", list_id, len(raw_items))
+
+    parsed: list[dict] = []
+    for item in raw_items:
+        fields = _parse_item_fields(item.get("fields", []), user_map)
+        title = ""
+        for f in item.get("fields", []):
+            if f.get("text"):
+                title = f["text"]
+                break
+        parsed.append({
+            "record_id": item["id"],
+            "list_id": item.get("list_id", list_id),
+            "date_created": item.get("date_created"),
+            "created_by_id": item.get("created_by", "UNKNOWN"),
+            "created_by_name": user_map.get(
+                item.get("created_by", ""), "UNKNOWN"
+            ),
+            "title": title,
+            "fields": fields,
+        })
+    return parsed
+
+
+def _build_list_data(
+    items: list[dict],
+    comment_groups: list[dict],
+) -> dict:
+    """
+    Merge list item details with comment groups from the hidden conversation.
+
+    Correlation strategy (in priority order):
+    1. Match by ``record_id`` extracted from the hidden conversation message
+       blocks/metadata against item ``record_id`` from the Lists API.
+    2. Fall back to ``date_created`` (integer) matched against
+       ``int(float(item_ts))`` for 1-second-precision timestamp matching.
+    Unmatched comment groups are preserved separately.
+    """
+    rid_map: dict[str, dict] = {}
+    ts_map: dict[int, list[dict]] = {}
+    for cg in comment_groups:
+        rid = cg.get("record_id")
+        if rid:
+            rid_map[rid] = cg
+        ts_int = int(float(cg["item_ts"]))
+        ts_map.setdefault(ts_int, []).append(cg)
+
+    used_ts: set[str] = set()
+    merged: list[dict] = []
+    matched_by_rid = 0
+    matched_by_ts = 0
+
+    for item in items:
+        entry = {**item, "comments": []}
+        rid = item.get("record_id")
+
+        if rid and rid in rid_map:
+            cg = rid_map[rid]
+            if cg["item_ts"] not in used_ts:
+                entry["comments"] = cg["comments"]
+                used_ts.add(cg["item_ts"])
+                matched_by_rid += 1
+        else:
+            dc = item.get("date_created")
+            if dc is not None:
+                for cg in ts_map.get(dc, []):
+                    if cg["item_ts"] not in used_ts:
+                        entry["comments"] = cg["comments"]
+                        used_ts.add(cg["item_ts"])
+                        matched_by_ts += 1
+                        break
+        merged.append(entry)
+
+    total_matched = matched_by_rid + matched_by_ts
+    unmatched_comments = [
+        {
+            "item_ts": cg["item_ts"],
+            "item_text": cg.get("item_text", ""),
+            "comments": cg["comments"],
+        }
+        for cg in comment_groups
+        if cg["item_ts"] not in used_ts
+    ]
+
+    logger.info(
+        "  Correlation: %d/%d items matched with comments "
+        "(%d by record_id, %d by timestamp), %d unmatched comment groups",
+        total_matched, len(items), matched_by_rid, matched_by_ts,
+        len(unmatched_comments),
+    )
+    return {"items": merged, "unmatched_comments": unmatched_comments}
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +585,49 @@ def extract_slack_data(config: dict | None = None) -> str:
             len(all_list_ids),
         )
 
-    # 6. Persist
+    # 6. Fetch list item details (requires lists:read scope)
+    list_data: dict[str, dict] = {}
+    if all_list_ids:
+        for list_id in sorted(all_list_ids):
+            items_detail: list[dict] = []
+            try:
+                items_detail = _fetch_list_items(client, list_id, user_map)
+            except SlackApiError as exc:
+                err = exc.response.get("error", "")
+                if err in ("missing_scope", "no_permission", "list_not_found"):
+                    logger.warning(
+                        "Bot token cannot fetch items for list %s (%s). "
+                        "Trying user token …",
+                        list_id, err,
+                    )
+                    if user_client:
+                        try:
+                            items_detail = _fetch_list_items(
+                                user_client, list_id, user_map,
+                            )
+                        except SlackApiError as exc2:
+                            logger.warning(
+                                "User token also failed for list %s: %s – "
+                                "item details will be unavailable",
+                                list_id,
+                                exc2.response.get("error", str(exc2)),
+                            )
+                    else:
+                        logger.warning(
+                            "No user token set – item details unavailable "
+                            "for list %s. Add lists:read scope to enable.",
+                            list_id,
+                        )
+                else:
+                    raise
+
+            comment_groups = list_comments.get(list_id, [])
+            list_data[list_id] = _build_list_data(items_detail, comment_groups)
+    elif list_comments:
+        for list_id, comment_groups in list_comments.items():
+            list_data[list_id] = _build_list_data([], comment_groups)
+
+    # 7. Persist
     messages_path = out_dir / "messages.json"
     with open(messages_path, "w", encoding="utf-8") as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
@@ -378,9 +636,20 @@ def extract_slack_data(config: dict | None = None) -> str:
         with open(out_dir / "list_comments.json", "w", encoding="utf-8") as f:
             json.dump(list_comments, f, ensure_ascii=False, indent=2)
 
+    if list_data:
+        with open(out_dir / "list_data.json", "w", encoding="utf-8") as f:
+            json.dump(list_data, f, ensure_ascii=False, indent=2)
+
     total_list_comments = sum(
         sum(len(it["comments"]) for it in items)
         for items in list_comments.values()
+    )
+    total_list_items = sum(
+        len(ld["items"]) for ld in list_data.values()
+    )
+    total_matched = sum(
+        sum(1 for it in ld["items"] if it["comments"])
+        for ld in list_data.values()
     )
     metadata = {
         "channel_id": channel_id,
@@ -390,8 +659,10 @@ def extract_slack_data(config: dict | None = None) -> str:
         "total_replies": sum(len(r["replies"]) for r in records),
         "list_item_messages": sum(1 for r in records if r["is_list_item"]),
         "lists_found": sorted(all_list_ids),
+        "total_list_items": total_list_items,
         "total_list_items_with_comments": sum(len(v) for v in list_comments.values()),
         "total_list_comments": total_list_comments,
+        "total_items_matched_with_comments": total_matched,
         "user_map": user_map,
     }
     with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
@@ -411,5 +682,10 @@ def extract_slack_data(config: dict | None = None) -> str:
             sum(len(v) for v in list_comments.values()),
             total_list_comments,
             len(list_comments),
+        )
+    if list_data:
+        logger.info(
+            "List item details – %d items fetched, %d matched with comments",
+            total_list_items, total_matched,
         )
     return str(out_dir.resolve())

@@ -67,8 +67,9 @@ SLACK_USER_TOKEN=xoxp-your-user-token-here
 GOOGLE_SERVICE_ACCOUNT_KEY_FILE=service-account-key.json
 ```
 
-- The Slack **bot token** requires these OAuth scopes: `channels:history`, `channels:read`, `users:read`, `users:read.email`.
-- The Slack **user token** (optional, for list item comment extraction) requires these User Token Scopes: `channels:history`, `groups:history`. If not set, the pipeline still runs but skips list item comment extraction.
+- The Slack **bot token** requires these OAuth scopes: `channels:history`, `channels:read`, `users:read`, `users:read.email`, `lists:read`.
+- The Slack **user token** (optional, for list item comment extraction) requires these User Token Scopes: `channels:history`, `groups:history`, `lists:read`. If not set, the pipeline still runs but skips list item comment extraction.
+- The `lists:read` scope enables fetching list item details (title, status, assignee, dates, notes) via `slackLists.items.list`. If missing, comments are still extracted but without correlated item details.
 - The Google service account key file must be a JSON key downloaded from the Google Cloud console. The Google Form must be shared with the service account's email address.
 
 ### 1b. `config.yaml` -- Main Configuration
@@ -196,8 +197,10 @@ flowchart TD
     MoreMessages -->|No| HasUserToken{"SLACK_USER_TOKEN set?"}
     HasUserToken -->|Yes| FetchListComments["For each unique list_id:\n1. Derive conversation C... from F...\n2. conversations.history on list conv\n3. conversations.replies for each threaded item"]
     HasUserToken -->|No| SkipLists["Log warning, skip list comments"]
-    FetchListComments --> SaveJSON["Save messages.json + list_comments.json"]
-    SkipLists --> SaveJSON
+    FetchListComments --> FetchListItems["For each unique list_id:\nCall slackLists.items.list\n(bot token, fallback to user token)"]
+    SkipLists --> FetchListItems
+    FetchListItems --> Correlate["Correlate items with comments\n(match date_created ↔ item_ts)"]
+    Correlate --> SaveJSON["Save messages.json + list_comments.json + list_data.json"]
     SaveJSON --> SaveMeta["Save metadata.json"]
     SaveMeta --> Done[Return output directory path]
 ```
@@ -231,6 +234,13 @@ flowchart TD
   4. Calls `conversations.replies` for each item with `reply_count > 0` to fetch comments.
   5. Saves the results in `list_comments.json` keyed by list ID.
   6. If the user token cannot access a list conversation, logs a warning and skips that list.
+- **List Item Detail Extraction** (requires `lists:read` scope): After fetching comments, the extractor calls `slackLists.items.list` for each list to retrieve structured item details (title, status, owner, date, notes, etc.). The process:
+  1. Tries the bot token first; falls back to the user token if the bot lacks `lists:read`.
+  2. Parses each item's `fields` array into a flat key-value dict (text, select, date, user, number, etc.).
+  3. Uses the first text field as the item title.
+  4. Correlates items with hidden conversation comments by matching `date_created` (integer, from the Lists API) against `int(float(item_ts))` (from the hidden conversation). Matched items inherit their comment threads.
+  5. Unmatched comment groups (where no item detail could be correlated) are preserved separately.
+  6. Saves the merged result in `list_data.json` keyed by list ID, containing `items` (with details + matched comments) and `unmatched_comments`.
 - **Raw Data Schema** (`messages.json`): A JSON array where each element is:
 
 ```json
@@ -280,7 +290,48 @@ flowchart TD
   }
 ```
 
-- **Output**: `metadata.json` alongside `messages.json` (and optionally `list_comments.json`) records the channel ID, extraction timestamp, total message count, list statistics, and the user map.
+- **List Data Schema** (`list_data.json`): A dict keyed by list ID, each containing `items` (with details and matched comments) and `unmatched_comments`:
+
+```json
+  {
+    "F07SBP17R7Z": {
+      "items": [
+        {
+          "record_id": "Rec07TF61CLDN",
+          "list_id": "F07SBP17R7Z",
+          "date_created": 1710000000,
+          "created_by_id": "U12345ABC",
+          "created_by_name": "john.doe",
+          "title": "Fix SSL certificate issue",
+          "fields": {
+            "rich_text_notes": "Fix SSL certificate issue",
+            "status": "in_progress",
+            "owner": "john.doe",
+            "date": "2024-03-10"
+          },
+          "comments": [
+            {
+              "ts": "1710000001.000200",
+              "user_id": "U67890DEF",
+              "user_name": "jane.smith",
+              "text": "Looking into this issue now",
+              "link": "https://workspace.slack.com/archives/C07SBP17R7Z/p1710000001000200?..."
+            }
+          ]
+        }
+      ],
+      "unmatched_comments": [
+        {
+          "item_ts": "1710500000.000100",
+          "item_text": "A comment was added",
+          "comments": [...]
+        }
+      ]
+    }
+  }
+```
+
+- **Output**: `metadata.json` alongside `messages.json`, `list_comments.json`, and `list_data.json` records the channel ID, extraction timestamp, total message count, list statistics (including items matched with comments), and the user map.
 
 ---
 
@@ -291,40 +342,70 @@ flowchart TD
 ```mermaid
 flowchart TD
     Start[Start] --> LoadRaw["Load messages.json from raw data dir"]
-    LoadRaw --> LoadExclusion[Load exclusion_rules.yaml]
-    LoadExclusion --> BuildAnonMap["Build user_id -> @userN anonymization map"]
+    LoadRaw --> LoadListData{"list_data.json exists?"}
+    LoadListData -->|Yes| LoadLD["Load list_data.json"]
+    LoadListData -->|No| LoadLegacy{"list_comments.json exists?"}
+    LoadLegacy -->|Yes| LoadLC["Load list_comments.json\n(convert to list_data format)"]
+    LoadLegacy -->|No| LoadExclusion
+    LoadLD --> LoadExclusion[Load exclusion_rules.yaml]
+    LoadLC --> LoadExclusion
+    LoadExclusion --> BuildAnonMap["Build user_id -> @userN map\n(from messages + replies + list items + comments)"]
     BuildAnonMap --> IterateMsg[For each message + its replies]
-    IterateMsg --> CheckAuthor{"Author in excluded_users?"}
-    CheckAuthor -->|Yes| Skip[Skip message]
-    CheckAuthor -->|No| CheckMentions{"Any <@excluded_user> in text?"}
-    CheckMentions -->|Yes| Skip
-    CheckMentions -->|No| CheckLink{"Message link in excluded_message_links?"}
-    CheckLink -->|Yes| Skip
-    CheckLink -->|No| Anonymize["Replace all <@UXXXX> with @userN"]
+    IterateMsg --> CheckExclude{"Excluded by author,\nmention, or link?"}
+    CheckExclude -->|Yes| Skip[Skip]
+    CheckExclude -->|No| Anonymize["Replace all <@UXXXX> with @userN"]
     Anonymize --> AppendOutput[Append to output text]
     Skip --> NextMsg{More messages?}
     AppendOutput --> NextMsg
     NextMsg -->|Yes| IterateMsg
-    NextMsg -->|No| WriteFile["Write all_messages.txt to slack_processed_data_<ts>/"]
+    NextMsg -->|No| HasLD{"list_data loaded?"}
+    HasLD -->|Yes| IterateItems["For each list item:\n1. Output item title + fields\n2. Output matched comments"]
+    HasLD -->|No| WriteFile
+    IterateItems --> IterateUnmatched["For unmatched comments:\noutput in separate section"]
+    IterateUnmatched --> WriteFile["Write all_messages.txt to slack_processed_data_<ts>/"]
     WriteFile --> SaveMap["Save anonymization_map.json"]
     SaveMap --> Done[Return output directory path]
 ```
 
 ### Key Implementation Details
 
-- **Anonymization Map**: Scan all messages (including replies) to collect every unique `user_id`. Assign sequential dummy names: `@user1`, `@user2`, ... Store the mapping in `anonymization_map.json` for traceability (maps dummy name back to original user_id).
-- **Exclusion Logic** (applied to every message AND every reply independently):
+- **Anonymization Map**: Scan all messages (including replies) AND list item comments to collect every unique `user_id`. Assign sequential dummy names: `@user1`, `@user2`, ... Store the mapping in `anonymization_map.json` for traceability (maps dummy name back to original user_id).
+- **Exclusion Logic** (applied to every message, reply, AND list item comment independently):
   1. **Author exclusion**: If `message.user_id` is in `excluded_users` list, skip the entire message.
   2. **Mention exclusion**: Parse all `<@UXXXXXXX>` patterns in the message text. If ANY matched user_id is in `excluded_users`, skip the message.
   3. **Link exclusion**: If `message.link` is in `excluded_message_links`, skip the message.
 - **User Mention Replacement**: After exclusion checks pass, use regex `r'<@(U[A-Z0-9]+)>'` to find all user mentions in the text and replace each with the corresponding `@userN` from the anonymization map.
-- **Output Format** (`all_messages.txt`): One message per logical block, ordered chronologically. Thread replies indented under their parent:
+- **List Item Processing**: The sanitizer loads `list_data.json` (preferred) or falls back to `list_comments.json` (legacy). For the new format:
+  1. Each list item is output with its title and field metadata (status, owner, date, etc.), followed immediately by its matched comments.
+  2. Fields that duplicate the title are skipped. Field keys are title-cased with underscores replaced by spaces.
+  3. Unmatched comments (where no item detail could be correlated) are output in a separate "Additional Comments" section per list.
+  4. The same exclusion + anonymization rules apply to item fields and comments.
+- **Output Format** (`all_messages.txt`): Channel messages first (ordered chronologically, thread replies indented), then list items with their comments:
 
 ```
   [2024-03-10 14:30:00] @user1: Hello @user2 please review this
     [2024-03-10 14:31:00] @user2: Sure, looking at it now
     [2024-03-10 14:35:00] @user3: Done, LGTM
   [2024-03-10 15:00:00] @user4: Deployment complete
+
+  ============================================================
+  SLACK LIST ITEMS AND COMMENTS
+  ============================================================
+
+  --- List F07SBP17R7Z ---
+
+  [Item: Fix SSL certificate issue]
+    Status: in_progress | Owner: @user1 | Date: 2024-03-10
+    [2024-03-10 14:31:00] @user2: Looking into this issue now
+    [2024-03-10 14:35:00] @user3: Fixed in PR #42
+
+  [Item: Dashboard improvements]
+    Status: completed | Owner: @user3
+
+  --- Additional Comments (List F07SBP17R7Z) ---
+
+  [List Item 2024-03-10 16:00:00]
+    [2024-03-10 16:05:00] @user4: Some discussion here
 ```
 
   Timestamps derived from Slack `ts` field (Unix epoch -> human-readable UTC).
