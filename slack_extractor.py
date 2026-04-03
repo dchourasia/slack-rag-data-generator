@@ -351,28 +351,54 @@ def _fetch_list_items(
     client: WebClient,
     list_id: str,
     user_map: dict[str, str],
+    *,
+    include_archived: bool = True,
 ) -> list[dict]:
     """
     Fetch every item from a Slack List via ``slackLists.items.list``.
+
+    When *include_archived* is True (default), a second paginated pass
+    with ``archived=true`` is made so that deleted/archived items can be
+    correlated with their comments from the hidden conversation.
 
     Returns a list of dicts with ``record_id``, ``title``, ``fields``, etc.
     Requires the ``lists:read`` OAuth scope on the token.
     """
     logger.info("Fetching list item details for %s via slackLists.items.list …", list_id)
-    raw_items: list[dict] = []
-    cursor: str | None = None
-    while True:
-        payload: dict = {"list_id": list_id, "limit": 100}
-        if cursor:
-            payload["cursor"] = cursor
-        api_fn = partial(client.api_call, "slackLists.items.list")
-        resp = _call_with_retry(api_fn, json=payload)
-        raw_items.extend(resp.get("items", []))
-        cursor = resp.get("response_metadata", {}).get("next_cursor")
-        if not cursor:
-            break
 
-    logger.info("  List %s: %d items from Lists API", list_id, len(raw_items))
+    def _paginate(archived: bool = False) -> list[dict]:
+        collected: list[dict] = []
+        cursor: str | None = None
+        while True:
+            payload: dict = {"list_id": list_id, "limit": 100}
+            if archived:
+                payload["archived"] = True
+            if cursor:
+                payload["cursor"] = cursor
+            api_fn = partial(client.api_call, "slackLists.items.list")
+            resp = _call_with_retry(api_fn, json=payload)
+            collected.extend(resp.get("items", []))
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        return collected
+
+    raw_items = _paginate(archived=False)
+    active_count = len(raw_items)
+
+    archived_count = 0
+    if include_archived:
+        try:
+            archived_items = _paginate(archived=True)
+            archived_count = len(archived_items)
+            raw_items.extend(archived_items)
+        except Exception:
+            logger.warning("  Could not fetch archived items for %s – skipping", list_id)
+
+    logger.info(
+        "  List %s: %d items from Lists API (%d active, %d archived)",
+        list_id, len(raw_items), active_count, archived_count,
+    )
 
     parsed: list[dict] = []
     for item in raw_items:
@@ -396,6 +422,9 @@ def _fetch_list_items(
     return parsed
 
 
+TS_MATCH_WINDOW = 5  # seconds of tolerance for fuzzy timestamp matching
+
+
 def _build_list_data(
     items: list[dict],
     comment_groups: list[dict],
@@ -406,18 +435,19 @@ def _build_list_data(
     Correlation strategy (in priority order):
     1. Match by ``record_id`` extracted from the hidden conversation message
        blocks/metadata against item ``record_id`` from the Lists API.
-    2. Fall back to ``date_created`` (integer) matched against
-       ``int(float(item_ts))`` for 1-second-precision timestamp matching.
+    2. Fuzzy timestamp matching: ``date_created`` (integer, from Lists API)
+       matched against ``int(float(item_ts))`` within a ±5-second window.
+       The item creation timestamp and the hidden conversation message
+       timestamp typically differ by 1-3 seconds.
     Unmatched comment groups are preserved separately.
     """
     rid_map: dict[str, dict] = {}
-    ts_map: dict[int, list[dict]] = {}
+    cg_by_ts_int: list[tuple[int, dict]] = []
     for cg in comment_groups:
         rid = cg.get("record_id")
         if rid:
             rid_map[rid] = cg
-        ts_int = int(float(cg["item_ts"]))
-        ts_map.setdefault(ts_int, []).append(cg)
+        cg_by_ts_int.append((int(float(cg["item_ts"])), cg))
 
     used_ts: set[str] = set()
     merged: list[dict] = []
@@ -437,12 +467,19 @@ def _build_list_data(
         else:
             dc = item.get("date_created")
             if dc is not None:
-                for cg in ts_map.get(dc, []):
-                    if cg["item_ts"] not in used_ts:
-                        entry["comments"] = cg["comments"]
-                        used_ts.add(cg["item_ts"])
-                        matched_by_ts += 1
-                        break
+                best_cg = None
+                best_diff = TS_MATCH_WINDOW + 1
+                for ts_int, cg in cg_by_ts_int:
+                    if cg["item_ts"] in used_ts:
+                        continue
+                    diff = abs(ts_int - dc)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_cg = cg
+                if best_cg is not None and best_diff <= TS_MATCH_WINDOW:
+                    entry["comments"] = best_cg["comments"]
+                    used_ts.add(best_cg["item_ts"])
+                    matched_by_ts += 1
         merged.append(entry)
 
     total_matched = matched_by_rid + matched_by_ts

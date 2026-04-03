@@ -33,7 +33,7 @@ isProject: false
 
 ## Project Structure
 
-All files live in the workspace root: `/home/dchouras/RHODS/DevOps/AI/DevTestOps NotebookLM/`
+All files live in the workspace root: `/Users/dchouras/RHODS/DevOps/slack-rag-data-generator/`
 
 ```
 .
@@ -221,7 +221,10 @@ flowchart TD
           break
 ```
 
-- **Rate Limiting (HTTP 429)**: Wrap every API call in a retry helper that catches `SlackApiError`. When `response.status_code == 429`, read the `Retry-After` header (seconds) and `time.sleep()` that duration (minimum 1 second fallback). Retry up to 5 times with exponential backoff.
+- **Rate Limiting & Resilient Retries**: Wrap every API call in `_call_with_retry`, which handles three error categories up to 5 retries:
+  1. **HTTP 429 (rate-limit)**: Catches `SlackApiError` with `status_code == 429`, reads the `Retry-After` header and sleeps that duration (minimum 1 second fallback).
+  2. **Network errors**: Catches `ConnectionError`, `TimeoutError`, and `OSError` and retries with exponential backoff (`1s, 2s, 4s, …`).
+  3. **Incomplete responses**: Catches any exception whose type name or message contains `IncompleteRead` (HTTP chunked-transfer failures) and retries with the same exponential backoff.
 - **User Map**: Before extracting messages, fetch all users via `users.list` (paginated) to build a `dict[str, str]` mapping `user_id` -> `real_name` or `display_name`. This map is saved alongside the raw data for reference.
 - **Message Link Construction**: Build links locally instead of calling `chat.getPermalink` (avoids extra rate-limited API calls):
   - Top-level message: `{workspace_url}/archives/{channel_id}/p{ts.replace('.', '')}`
@@ -234,13 +237,19 @@ flowchart TD
   4. Calls `conversations.replies` for each item with `reply_count > 0` to fetch comments.
   5. Saves the results in `list_comments.json` keyed by list ID.
   6. If the user token cannot access a list conversation, logs a warning and skips that list.
+- **Record ID Extraction from Hidden Conversation Messages**: Each item message in the hidden conversation is inspected by `_extract_record_id_from_message()` to extract the `record_id` it represents. The function tries three strategies in order:
+  1. Parse the message's `blocks` → `elements` → child elements, looking for URLs containing the list ID and extracting the `record_id=RecXXX` query parameter, or for text containing a `RecXXX` pattern.
+  2. Check `metadata.event_payload` for a `record_id` or `item_id` key.
+  3. Regex-search the message's plain `text` for `record_id=RecXXX`.
+  The extracted record_id is stored alongside each comment group so it can later be used for precise correlation with list item details.
 - **List Item Detail Extraction** (requires `lists:read` scope): After fetching comments, the extractor calls `slackLists.items.list` for each list to retrieve structured item details (title, status, owner, date, notes, etc.). The process:
   1. Tries the bot token first; falls back to the user token if the bot lacks `lists:read`.
-  2. Parses each item's `fields` array into a flat key-value dict (text, select, date, user, number, etc.).
-  3. Uses the first text field as the item title.
-  4. Correlates items with hidden conversation comments by matching `date_created` (integer, from the Lists API) against `int(float(item_ts))` (from the hidden conversation). Matched items inherit their comment threads.
-  5. Unmatched comment groups (where no item detail could be correlated) are preserved separately.
-  6. Saves the merged result in `list_data.json` keyed by list ID, containing `items` (with details + matched comments) and `unmatched_comments`.
+  2. Fetches **both active and archived items** (two paginated passes: default + `archived=true`). Archived items are items that were deleted or completed and removed from the active list but still have comments in the hidden conversation.
+  3. Parses each item's `fields` array into a flat key-value dict (text, select, date, user, number, etc.).
+  4. Uses the first text field as the item title.
+  5. Correlates items with hidden conversation comments using **fuzzy timestamp matching** (±5 second window). The Lists API `date_created` and the hidden conversation `item_ts` represent the same creation event but are recorded 1-3 seconds apart. The algorithm finds the closest timestamp match within the window for each item.
+  6. Unmatched comment groups (where no item detail could be correlated, e.g. system events) are preserved separately.
+  7. Saves the merged result in `list_data.json` keyed by list ID, containing `items` (with details + matched comments) and `unmatched_comments`.
 - **Raw Data Schema** (`messages.json`): A JSON array where each element is:
 
 ```json
@@ -350,16 +359,21 @@ flowchart TD
     LoadLD --> LoadExclusion[Load exclusion_rules.yaml]
     LoadLC --> LoadExclusion
     LoadExclusion --> BuildAnonMap["Build user_id -> @userN map\n(from messages + replies + list items + comments)"]
-    BuildAnonMap --> IterateMsg[For each message + its replies]
+    BuildAnonMap --> BuildItemLookup["Build item_lookup: record_id -> item detail\n(from list_data items)"]
+    BuildItemLookup --> IterateMsg[For each message + its replies]
     IterateMsg --> CheckExclude{"Excluded by author,\nmention, or link?"}
     CheckExclude -->|Yes| Skip[Skip]
     CheckExclude -->|No| Anonymize["Replace all <@UXXXX> with @userN"]
     Anonymize --> AppendOutput[Append to output text]
-    Skip --> NextMsg{More messages?}
-    AppendOutput --> NextMsg
+    AppendOutput --> IsListItem{"is_list_item\nand has list_refs?"}
+    IsListItem -->|Yes| InlineEmit["Emit item fields + comments inline\nTrack record_id in emitted_rids"]
+    IsListItem -->|No| ProcessReplies[Process thread replies]
+    InlineEmit --> ProcessReplies
+    ProcessReplies --> NextMsg{More messages?}
+    Skip --> NextMsg
     NextMsg -->|Yes| IterateMsg
     NextMsg -->|No| HasLD{"list_data loaded?"}
-    HasLD -->|Yes| IterateItems["For each list item:\n1. Output item title + fields\n2. Output matched comments"]
+    HasLD -->|Yes| IterateItems["For each list item NOT in emitted_rids:\n1. Output item title + fields\n2. Output matched comments"]
     HasLD -->|No| WriteFile
     IterateItems --> IterateUnmatched["For unmatched comments:\noutput in separate section"]
     IterateUnmatched --> WriteFile["Write all_messages.txt to slack_processed_data_<ts>/"]
@@ -375,17 +389,24 @@ flowchart TD
   2. **Mention exclusion**: Parse all `<@UXXXXXXX>` patterns in the message text. If ANY matched user_id is in `excluded_users`, skip the message.
   3. **Link exclusion**: If `message.link` is in `excluded_message_links`, skip the message.
 - **User Mention Replacement**: After exclusion checks pass, use regex `r'<@(U[A-Z0-9]+)>'` to find all user mentions in the text and replace each with the corresponding `@userN` from the anonymization map.
-- **List Item Processing**: The sanitizer loads `list_data.json` (preferred) or falls back to `list_comments.json` (legacy). For the new format:
+- **Item Lookup Map**: Before iterating messages, the sanitizer builds a `record_id -> item detail` lookup dict from all items across all lists in `list_data`. This allows O(1) lookup when a channel message references a specific list item.
+- **Inline List Item Emission**: When processing channel messages, if a message has `is_list_item=True` and its `list_refs` contain record IDs found in the item lookup, the item's field metadata and comments are emitted **inline** immediately after the message text. Each emitted record_id is tracked in an `emitted_rids` set to prevent duplication.
+- **List Item Processing (dedicated section)**: The sanitizer loads `list_data.json` (preferred) or falls back to `list_comments.json` (legacy). After all channel messages are processed, remaining items (those **not** already emitted inline) are output in a dedicated "SLACK LIST ITEMS AND COMMENTS" section:
   1. Each list item is output with its title and field metadata (status, owner, date, etc.), followed immediately by its matched comments.
   2. Fields that duplicate the title are skipped. Field keys are title-cased with underscores replaced by spaces.
   3. Unmatched comments (where no item detail could be correlated) are output in a separate "Additional Comments" section per list.
   4. The same exclusion + anonymization rules apply to item fields and comments.
-- **Output Format** (`all_messages.txt`): Channel messages first (ordered chronologically, thread replies indented), then list items with their comments:
+- **Output Format** (`all_messages.txt`): Channel messages first (ordered chronologically, thread replies indented). When a channel message references a list item, the item's fields and comments appear inline right after it. Then a dedicated section outputs remaining items not already emitted inline:
 
 ```
   [2024-03-10 14:30:00] @user1: Hello @user2 please review this
     [2024-03-10 14:31:00] @user2: Sure, looking at it now
     [2024-03-10 14:35:00] @user3: Done, LGTM
+  [2024-03-10 14:45:00] @user1: <list URL for Fix SSL certificate issue>
+    [Item: Fix SSL certificate issue]
+    Status: in_progress | Owner: @user1 | Date: 2024-03-10
+    [2024-03-10 14:46:00] @user2: Looking into this issue now
+    [2024-03-10 14:50:00] @user3: Fixed in PR #42
   [2024-03-10 15:00:00] @user4: Deployment complete
 
   ============================================================
@@ -393,11 +414,6 @@ flowchart TD
   ============================================================
 
   --- List F07SBP17R7Z ---
-
-  [Item: Fix SSL certificate issue]
-    Status: in_progress | Owner: @user1 | Date: 2024-03-10
-    [2024-03-10 14:31:00] @user2: Looking into this issue now
-    [2024-03-10 14:35:00] @user3: Fixed in PR #42
 
   [Item: Dashboard improvements]
     Status: completed | Owner: @user3
@@ -407,6 +423,8 @@ flowchart TD
   [List Item 2024-03-10 16:00:00]
     [2024-03-10 16:05:00] @user4: Some discussion here
 ```
+
+  Note: "Fix SSL certificate issue" does NOT appear in the dedicated section because it was already emitted inline with the channel message that referenced it.
 
   Timestamps derived from Slack `ts` field (Unix epoch -> human-readable UTC).
 

@@ -213,6 +213,7 @@ def sanitize_data(raw_data_dir: str, config: dict | None = None) -> str:
     skipped_messages = 0
     kept_replies = 0
     skipped_replies = 0
+    emitted_rids: set[str] = set()
 
     for msg in messages:
         if _should_exclude(msg, excluded_users, excluded_links):
@@ -231,9 +232,25 @@ def sanitize_data(raw_data_dir: str, config: dict | None = None) -> str:
                 rid = ref.get("record_id")
                 if rid and rid not in seen_rids and rid in item_lookup:
                     seen_rids.add(rid)
+                    emitted_rids.add(rid)
+                    item = item_lookup[rid]
                     lines.extend(
-                        _format_item_fields(item_lookup[rid], anon_map)
+                        _format_item_fields(item, anon_map)
                     )
+                    for comment in item.get("comments", []):
+                        if _should_exclude(
+                            comment, excluded_users, excluded_links
+                        ):
+                            continue
+                        c_author = anon_map.get(
+                            comment["user_id"],
+                            f"@unknown_{comment['user_id']}",
+                        )
+                        c_text = _anonymize_text(
+                            comment.get("text", ""), anon_map,
+                        )
+                        c_ts = _ts_to_datetime(comment["ts"])
+                        lines.append(f"  [{c_ts}] {c_author}: {c_text}")
 
         for reply in msg.get("replies", []):
             if _should_exclude(reply, excluded_users, excluded_links):
@@ -270,6 +287,10 @@ def sanitize_data(raw_data_dir: str, config: dict | None = None) -> str:
             lines.append(f"--- List {list_id} ---")
 
             for item in items:
+                rid = item.get("record_id")
+                if rid and rid in emitted_rids:
+                    continue
+
                 title = item.get("title", "").strip()
                 fields = item.get("fields", {})
                 comments = item.get("comments", [])
